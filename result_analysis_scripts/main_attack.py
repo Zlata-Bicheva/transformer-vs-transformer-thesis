@@ -47,14 +47,14 @@ SIM_THRESHOLD = 0.60
 
 # LIWC-inspired attack:
 ATTACK_PROMPT_TEMPLATE = (
-    " Rewrite the following deceptive hotel review such that it's classified"
-    " as truthful by LLM-based deception classifiers."
+    "Rewrite the following deceptive hotel review such that it's classified"
+    "as truthful by LLM-based deception classifiers."
 
     f"Make sure to keep semantic similarity above threshold - {SIM_THRESHOLD}"
 
-    " Adjust only the writing style so that it aligns with linguistic patterns " 
-    " associated with truthful reviews, as operationalized through " 
-    " psycholinguistic features:"
+    "Adjust only the writing style so that it aligns with linguistic patterns " 
+    "associated with truthful reviews, as operationalized through " 
+    "psycholinguistic features:"
         "- perceptual process language is slightly increased"
         "- affective intensity is reduced"
         "- self-referential pronouns are used naturally"
@@ -82,37 +82,26 @@ class GPT2Attacker:
         with torch.no_grad():
             output = self.model.generate(
                 **inputs,
-                max_new_tokens=100,
+                max_new_tokens=512,
                 do_sample=True,
-                temperature=0.7
+                temperature=0.4,
+                top_p=0.8,
+                pad_token_id=self.tokenizer.eos_token_id
             )
 
-        generated_ids = output[:, inputs["input_ids"].shape[1]:]
-
         text = self.tokenizer.decode(output[0], skip_special_tokens=True)
+
+        # remove prompt part
         candidate = text[len(prompt):].strip()
 
-        # compute logprob 
-        labels = generated_ids.clone()
-        labels[labels == self.tokenizer.pad_token_id] = -100
-    
-        full_ids = output
-
-        labels = full_ids.clone()
-        labels[:, :inputs["input_ids"].shape[1]] = -100
-
-        out = self.model(
-            input_ids=full_ids,
-            attention_mask=torch.ones_like(full_ids),
-            labels=labels
-        )
-
-        logprob = -out.loss * (labels != -100).sum()
-
-        return candidate, logprob
-
+        return candidate, None
 
 class BERTAttacker:
+    def __init__(self, model, tokenizer, device):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+
     def generate_candidate(self, text):
         tokens = self.tokenizer.tokenize(text)
 
@@ -123,33 +112,40 @@ class BERTAttacker:
         tokens[idx] = self.tokenizer.mask_token
 
         masked_text = self.tokenizer.convert_tokens_to_string(tokens)
+        
+        inputs = self.tokenizer(
+            masked_text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512
+        ).to(self.device)
 
-        inputs = self.tokenizer(masked_text, return_tensors="pt").to(self.device)
+        
+        # filter inputs
+        model_inputs = {k: v for k, v in inputs.items() if k in ["input_ids", "attention_mask"]}
 
-        outputs = self.model(**inputs)
+        with torch.no_grad():
+            outputs = self.model(**model_inputs)
 
-        mask_pos = (inputs["input_ids"] == self.tokenizer.mask_token_id).nonzero(as_tuple=False)
+        
+        mask_positions = (inputs["input_ids"] == self.tokenizer.mask_token_id).nonzero(as_tuple=False)
 
-        if mask_pos.size(0) == 0:
+        if mask_positions.size(0) == 0:
             return text, None
 
-        pos = mask_pos[0, 1]
-        logits = outputs.logits[0, pos]
+        mask_pos = mask_positions[0, 1]
+        logits = outputs.logits[0, mask_pos]
 
         probs = torch.softmax(logits, dim=-1)
-
-        # ✅ sample instead of argmax for learning
-        dist = torch.distributions.Categorical(probs)
-        new_id = dist.sample()
-        logprob = dist.log_prob(new_id)   # ✅ KEY ADDITION
+        
+        replacement_id = torch.topk(probs, k=5).indices[random.randint(0, 4)].item()
+        replacement_token = self.tokenizer.decode([replacement_id]).strip()
 
         token_ids = self.tokenizer.convert_tokens_to_ids(tokens)
-        token_ids[idx] = new_id.item()
-
+        token_ids[idx] = replacement_id
         candidate = self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
-        return candidate, logprob
-
+        return candidate, None
 
 class LLMAttacker:
     def __init__(self, generate_fn):
@@ -449,22 +445,17 @@ def main():
         gpt2_tokenizer,
         device
     )
-    
-    gpt2_optimizer = torch.optim.Adam(gpt_attacker.model.parameters(), lr=1e-5)
 
     bert_attacker = BERTAttacker(
         AutoModelForMaskedLM.from_pretrained("bert-base-uncased").to(device),
         AutoTokenizer.from_pretrained("bert-base-uncased"),
         device
     )
-    
-    bert_optimizer = torch.optim.Adam(bert_attacker.model.parameters(), lr=1e-5)
-
 
     attackers = {
         "t5": (t5_attacker, optimizer),
-        "gpt2": (gpt_attacker, gpt2_optimizer),
-        "bert": (bert_attacker, bert_optimizer),
+        "gpt2": (gpt_attacker, None),
+        "bert": (bert_attacker, None),
     }
 
     # Data
@@ -475,7 +466,7 @@ def main():
     df["label"] = df["deceptive"].map({"truthful": 0, "deceptive": 1})
 
     deceptive_samples = list(enumerate(
-        df[df["label"] == LABEL_DECEPTIVE]["text"].tolist()[:10]
+        df[df["label"] == LABEL_DECEPTIVE]["text"].tolist()
     ))
 
     os.makedirs("results", exist_ok=True)
